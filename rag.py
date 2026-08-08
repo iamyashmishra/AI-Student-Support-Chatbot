@@ -1,170 +1,129 @@
 import os
-import numpy as np
-import faiss
 
-from pypdf import PdfReader
+import faiss
+import numpy as np
+from dotenv import load_dotenv
 from google import genai
 from google.genai import types
-from dotenv import load_dotenv
+from pypdf import PdfReader
 
-
-# Load API key
 load_dotenv()
 
-api_key = os.getenv("GEMINI_API_KEY")
-
-if not api_key:
-    raise ValueError("GEMINI_API_KEY not found in .env")
-
-
-# Gemini client
-client = genai.Client(api_key=api_key)
-
-
-# PDF folder
 DOCUMENTS_FOLDER = "documents"
+DATA_FILE = os.path.join("data", "college_info.txt")
+CHUNK_SIZE = 1000
+EMBED_MODEL = "gemini-embedding-001"
 
 
-# Store our text chunks
-chunks = []
+def _get_client() -> genai.Client:
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise ValueError("GEMINI_API_KEY not found in .env")
+    return genai.Client(api_key=api_key)
 
 
-# ==========================================
-# READ PDF FILES
-# ==========================================
+def _chunk_text(text: str, source: str, chunks: list[dict]) -> None:
+    for i in range(0, len(text), CHUNK_SIZE):
+        chunk = text[i : i + CHUNK_SIZE]
+        if chunk.strip():
+            chunks.append({"text": chunk, "source": source})
 
-for filename in os.listdir(DOCUMENTS_FOLDER):
 
-    if filename.lower().endswith(".pdf"):
+def _load_chunks() -> list[dict]:
+    chunks: list[dict] = []
 
-        pdf_path = os.path.join(
-            DOCUMENTS_FOLDER,
-            filename
+    if os.path.isdir(DOCUMENTS_FOLDER):
+        for filename in sorted(os.listdir(DOCUMENTS_FOLDER)):
+            if not filename.lower().endswith(".pdf"):
+                continue
+
+            pdf_path = os.path.join(DOCUMENTS_FOLDER, filename)
+            reader = PdfReader(pdf_path)
+            full_text = ""
+
+            for page in reader.pages:
+                text = page.extract_text()
+                if text:
+                    full_text += text + "\n"
+
+            _chunk_text(full_text, filename, chunks)
+
+    if os.path.exists(DATA_FILE):
+        with open(DATA_FILE, encoding="utf-8") as file:
+            _chunk_text(file.read(), "college_info.txt", chunks)
+
+    if not chunks:
+        raise ValueError("No documents found. Add PDFs to documents/ or data/college_info.txt.")
+
+    return chunks
+
+
+class RAGIndex:
+    def __init__(self) -> None:
+        self.client = _get_client()
+        self.chunks = _load_chunks()
+        texts = [chunk["text"] for chunk in self.chunks]
+
+        result = self.client.models.embed_content(
+            model=EMBED_MODEL,
+            contents=texts,
+            config=types.EmbedContentConfig(task_type="RETRIEVAL_DOCUMENT"),
         )
 
-        print(f"Reading: {filename}")
-
-        reader = PdfReader(pdf_path)
-
-        full_text = ""
-
-        for page in reader.pages:
-
-            text = page.extract_text()
-
-            if text:
-                full_text += text + "\n"
-
-
-        # ==================================
-        # SPLIT TEXT INTO CHUNKS
-        # ==================================
-
-        chunk_size = 1000
-
-        for i in range(0, len(full_text), chunk_size):
-
-            chunk = full_text[i:i + chunk_size]
-
-            if chunk.strip():
-
-                chunks.append({
-                    "text": chunk,
-                    "source": filename
-                })
-
-
-print(f"\nTotal chunks created: {len(chunks)}")
-
-
-# ==========================================
-# CREATE EMBEDDINGS
-# ==========================================
-
-texts = [chunk["text"] for chunk in chunks]
-
-
-result = client.models.embed_content(
-    model="gemini-embedding-001",
-    contents=texts,
-    config=types.EmbedContentConfig(
-        task_type="RETRIEVAL_DOCUMENT"
-    )
-)
-
-
-embeddings = np.array(
-    [embedding.values for embedding in result.embeddings],
-    dtype="float32"
-)
-
-
-print("Embeddings created!")
-
-
-# ==========================================
-# CREATE FAISS INDEX
-# ==========================================
-
-dimension = embeddings.shape[1]
-
-index = faiss.IndexFlatL2(dimension)
-
-index.add(embeddings)
-
-
-print(f"FAISS index created with {index.ntotal} vectors")
-
-
-# ==========================================
-# SEARCH FUNCTION
-# ==========================================
-
-def search_documents(question, number_of_results=3):
-
-    query_result = client.models.embed_content(
-        model="gemini-embedding-001",
-        contents=question,
-        config=types.EmbedContentConfig(
-            task_type="RETRIEVAL_QUERY"
+        embeddings = np.array(
+            [embedding.values for embedding in result.embeddings],
+            dtype="float32",
         )
-    )
+
+        dimension = embeddings.shape[1]
+        self.index = faiss.IndexFlatL2(dimension)
+        self.index.add(embeddings)
+
+    def search(self, question: str, number_of_results: int = 3) -> list[dict]:
+        query_result = self.client.models.embed_content(
+            model=EMBED_MODEL,
+            contents=question,
+            config=types.EmbedContentConfig(task_type="RETRIEVAL_QUERY"),
+        )
+
+        query_embedding = np.array(
+            [query_result.embeddings[0].values],
+            dtype="float32",
+        )
+
+        _, indices = self.index.search(query_embedding, number_of_results)
+
+        results = []
+        for idx in indices[0]:
+            if idx < len(self.chunks):
+                results.append(self.chunks[idx])
+
+        return results
 
 
-    query_embedding = np.array(
-        [query_result.embeddings[0].values],
-        dtype="float32"
-    )
+def search_documents(question: str, number_of_results: int = 3) -> list[dict]:
+    index = get_rag_index()
+    return index.search(question, number_of_results)
 
 
-    distances, indices = index.search(
-        query_embedding,
-        number_of_results
-    )
+_RAG_INDEX: RAGIndex | None = None
 
 
-    results = []
-
-    for idx in indices[0]:
-
-        if idx < len(chunks):
-
-            results.append(chunks[idx])
+def get_rag_index() -> RAGIndex:
+    global _RAG_INDEX
+    if _RAG_INDEX is None:
+        _RAG_INDEX = RAGIndex()
+    return _RAG_INDEX
 
 
-    return results
-# ==========================================
-# TEST SEARCH
-# ==========================================
+if __name__ == "__main__":
+    rag = get_rag_index()
+    sample = "What information is available about scholarships?"
+    hits = rag.search(sample)
 
-question = "What information is available about scholarships?"
+    print(f"Indexed {len(rag.chunks)} chunks\n")
+    print(f"Query: {sample}\n")
 
-results = search_documents(question)
-
-print("\nRelevant information:\n")
-
-for result in results:
-
-    print("SOURCE:", result["source"])
-    print(result["text"])
-    print("-" * 50)
+    for hit in hits:
+        print("SOURCE:", hit["source"])
+        print(hit["text"][:300], "...\n")
